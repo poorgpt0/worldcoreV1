@@ -257,33 +257,45 @@ export interface OrderBookLevel {
   total: number;
 }
 
+export interface DepthResult {
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+  spread: number;
+  spreadPercent: number;
+  bidTotal: number;
+  askTotal: number;
+  lastUpdateId?: number;
+}
+
 export async function fetchLiveBinanceDepth(
   symbol: string,
-  limit: number = 10
-): Promise<{ bids: OrderBookLevel[]; asks: OrderBookLevel[] }> {
+  limit: number = 15
+): Promise<DepthResult> {
   const cleanSymbol = (symbol.endsWith('USDT') ? symbol : `${symbol}USDT`).toUpperCase();
   let data: any = null;
 
+  // First try proxy endpoint as specified in requirements
   try {
-    const res = await fetch(`https://api.binance.com/api/v3/depth?symbol=${cleanSymbol}&limit=${limit}`);
-    if (res.ok) {
-      data = await res.json();
+    const proxyRes = await fetch(`/api/binance/depth?symbol=${cleanSymbol}&limit=${limit}`);
+    if (proxyRes.ok) {
+      data = await proxyRes.json();
     } else {
-      throw new Error(`Direct depth failed: ${res.status}`);
+      throw new Error(`Proxy depth failed with status ${proxyRes.status}`);
     }
-  } catch {
+  } catch (err) {
+    // Fallback to direct Binance endpoint if proxy is unavailable
     try {
-      const proxyRes = await fetch(`/api/binance/depth?symbol=${cleanSymbol}&limit=${limit}`);
-      if (proxyRes.ok) {
-        data = await proxyRes.json();
+      const res = await fetch(`https://api.binance.com/api/v3/depth?symbol=${cleanSymbol}&limit=${limit}`);
+      if (res.ok) {
+        data = await res.json();
       }
     } catch (e) {
-      console.warn('Failed proxy depth:', e);
+      console.warn('Failed both proxy and direct depth fetches:', e);
     }
   }
 
   if (!data || !Array.isArray(data.bids) || !Array.isArray(data.asks)) {
-    return { bids: [], asks: [] };
+    return { bids: [], asks: [], spread: 0, spreadPercent: 0, bidTotal: 0, askTotal: 0 };
   }
 
   let runningBidTotal = 0;
@@ -302,7 +314,20 @@ export async function fetchLiveBinanceDepth(
     return { price, qty, total: runningAskTotal };
   });
 
-  return { bids, asks };
+  const bestBid = bids.length > 0 ? bids[0].price : 0;
+  const bestAsk = asks.length > 0 ? asks[0].price : 0;
+  const spread = bestAsk > 0 && bestBid > 0 ? Math.max(0, bestAsk - bestBid) : 0;
+  const spreadPercent = bestAsk > 0 ? (spread / bestAsk) * 100 : 0;
+
+  return {
+    bids,
+    asks,
+    spread,
+    spreadPercent,
+    bidTotal: runningBidTotal,
+    askTotal: runningAskTotal,
+    lastUpdateId: data.lastUpdateId,
+  };
 }
 
 // Fetch recent trades
