@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild src/server-app.ts --bundle --platform=node --format=cjs --outfile=dist/server.cjs --external:vite",
+    "build": "vite build && esbuild src/server-app.ts --bundle --platform=node --format=esm --outfile=dist/server.js --packages=external",
     "start": "node server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
@@ -23,6 +23,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "dotenv": "^17.2.3",
+    "esbuild": "^0.28.2",
     "express": "^4.21.2",
     "firebase": "^12.12.0",
     "lightweight-charts": "^5.2.0",

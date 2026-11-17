@@ -3,11 +3,15 @@ import { GoogleGenAI } from '@google/genai';
 import path from 'path';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 dotenv.config({ quiet: true });
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10) || 3000;
+const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -205,8 +209,13 @@ app.get('/api/binance/trades', async (req, res) => {
   }
 });
 
+// ACME challenge handler for SSL certificate verification
+app.get('/.well-known/acme-challenge/:token', (req, res) => {
+  res.status(200).send(req.params.token);
+});
+
 // Health check endpoints for Cloud Run
-app.get('/healthz', (_req, res) => {
+app.all(['/healthz', '/_health'], (_req, res) => {
   res.status(200).send('OK');
 });
 
@@ -218,66 +227,55 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-function listenWithFallback(port: number) {
-  const server = app.listen(port, '0.0.0.0', () => {
-    console.log(`Server listening on http://0.0.0.0:${port}`);
-  });
-
-  server.on('error', (err) => {
-    const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: string }).code : '';
-    const fallbackPort = parseInt(process.env.DEFAULT_APP_PORT || '3000', 10) || 3000;
-    if (code === 'EADDRINUSE' && port !== fallbackPort) {
-      console.warn(`Port ${port} is in use, falling back to ${fallbackPort}`);
-      app.listen(fallbackPort, '0.0.0.0', () => {
-        console.log(`Server listening on http://0.0.0.0:${fallbackPort}`);
-      });
-    } else {
-      console.error('Server listen error:', err);
-    }
-  });
-}
+// Respond 200 OK to all HEAD requests (Cloud Run TCP/HTTP health probes)
+app.head('*', (req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    return next();
+  }
+  res.status(200).end();
+});
 
 async function startServer() {
   const cwd = process.cwd();
   const candidates = [
     path.resolve(cwd, 'dist'),
+    path.resolve(__dirname, 'dist'),
+    path.resolve(__dirname, '..', 'dist'),
     path.resolve(cwd),
   ];
   const distPath = candidates.find((d) => fs.existsSync(path.join(d, 'index.html'))) || path.resolve(cwd, 'dist');
   const indexPath = path.join(distPath, 'index.html');
 
-  app.use(express.static(distPath));
+  if (fs.existsSync(indexPath)) {
+    // Production Mode: Serve built static assets
+    app.use(express.static(distPath));
 
-  if (fs.existsSync(indexPath) && process.env.NODE_ENV === 'production') {
     app.use((req, res, next) => {
-      if (req.method !== 'GET' || req.path.startsWith('/api')) {
+      if (req.path.startsWith('/api') || req.path === '/healthz' || req.path === '/_health' || req.path.startsWith('/.well-known')) {
         return next();
       }
-      res.sendFile(indexPath);
-    });
-    listenWithFallback(PORT);
-  } else if (fs.existsSync(indexPath) && !fs.existsSync(path.resolve(cwd, 'node_modules', 'vite'))) {
-    app.use((req, res, next) => {
-      if (req.method !== 'GET' || req.path.startsWith('/api')) {
-        return next();
-      }
-      res.sendFile(indexPath);
-    });
-    listenWithFallback(PORT);
-  } else {
-    let viteMiddleware: express.RequestHandler | null = null;
-    app.use((req, res, next) => {
-      if (viteMiddleware) {
-        return viteMiddleware(req, res, next);
-      }
-      if (fs.existsSync(indexPath) && req.method === 'GET' && !req.path.startsWith('/api')) {
+      if (req.method === 'GET' || req.method === 'HEAD') {
         return res.sendFile(indexPath);
       }
       next();
     });
 
-    listenWithFallback(PORT);
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server listening on http://0.0.0.0:${PORT}`);
+    });
 
+    server.on('error', (err) => {
+      console.error('Server listen error:', err);
+    });
+
+    process.on('SIGTERM', () => {
+      server.close(() => process.exit(0));
+    });
+    process.on('SIGINT', () => {
+      server.close(() => process.exit(0));
+    });
+  } else {
+    // Development Mode: Mount Vite middlewares for HMR / instant dev
     try {
       const vitePkg = 'vite';
       const { createServer } = await import(vitePkg);
@@ -285,10 +283,25 @@ async function startServer() {
         server: { middlewareMode: true, hmr: false },
         appType: 'spa',
       });
-      viteMiddleware = vite.middlewares;
+      app.use(vite.middlewares);
     } catch (err) {
       console.error('Failed to initialize Vite middleware:', err);
     }
+
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server listening on http://0.0.0.0:${PORT}`);
+    });
+
+    server.on('error', (err) => {
+      console.error('Server listen error:', err);
+    });
+
+    process.on('SIGTERM', () => {
+      server.close(() => process.exit(0));
+    });
+    process.on('SIGINT', () => {
+      server.close(() => process.exit(0));
+    });
   }
 }
 
