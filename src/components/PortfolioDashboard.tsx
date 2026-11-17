@@ -28,7 +28,30 @@ import {
   EyeOff,
   Check,
   Layers,
+  FileSpreadsheet,
+  Download,
+  Calculator,
+  Info,
+  Sparkles,
 } from 'lucide-react';
+import { PortfolioRebalanceSimulator } from './PortfolioRebalanceSimulator';
+import { auth } from '../lib/firebase';
+import {
+  SimulatedTrade,
+  loadSimulatedTrades,
+  subscribeSimulatedTrades,
+} from '@/lib/simulatedTrades';
+import {
+  CostBasisMethod,
+  TaxStatusFilter,
+  computePhTaxSummary,
+  downloadPhTaxCsv,
+} from '@/lib/phTaxCsv';
+import {
+  fetchCoinGeckoMarketChart,
+  fetchCoinGeckoPhpRate,
+  CoinGeckoHistoricalPoint,
+} from '@/lib/coingecko';
 
 export interface PortfolioHolding {
   symbol: string;
@@ -100,51 +123,104 @@ export function PortfolioDashboard({
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [isEditingHoldings, setIsEditingHoldings] = useState(false);
   const [draftHoldings, setDraftHoldings] = useState<Record<string, string>>({});
-  const [historicalDailyCloses, setHistoricalDailyCloses] = useState<Record<string, number[]>>({});
+  const [historicalSeries, setHistoricalSeries] = useState<
+    Record<string, { byDate: Record<string, number>; points: CoinGeckoHistoricalPoint[] }>
+  >({});
+  const [livePhpRate, setLivePhpRate] = useState<number>(PHP_EXCHANGE_RATE);
+  const [chartMode, setChartMode] = useState<'portfolio' | 'asset'>('portfolio');
+  const [chartAssetSymbol, setChartAssetSymbol] = useState<string>('BTC');
+  const [isLoadingHistory, setIsLoadingHistory] = useState<boolean>(true);
+
+  // Philippine Crypto Tax CSV Export state
+  const [showTaxPanel, setShowTaxPanel] = useState(!compact);
+  const [simulatedTrades, setSimulatedTrades] = useState<SimulatedTrade[]>(() =>
+    loadSimulatedTrades()
+  );
+  const [taxPhpRate, setTaxPhpRate] = useState<string>(String(PHP_EXCHANGE_RATE));
+  const [taxPhpRateManuallyEdited, setTaxPhpRateManuallyEdited] = useState(false);
+  const [costBasisMethod, setCostBasisMethod] = useState<CostBasisMethod>('FIFO');
+  const [taxYear, setTaxYear] = useState<string>('ALL');
+  const [taxStatusFilter, setTaxStatusFilter] = useState<TaxStatusFilter>('filled_only');
+  const [lastDownloadedFile, setLastDownloadedFile] = useState<string | null>(null);
+
+  // AI Portfolio Rebalance Simulation state
+  const [showRebalancePanel, setShowRebalancePanel] = useState<boolean>(false);
+  const [previousHoldings, setPreviousHoldings] = useState<PortfolioHolding[] | null>(null);
 
   useEffect(() => {
     saveStoredHoldings(holdings);
   }, [holdings]);
 
-  // Fetch real 30-day daily klines from Binance proxy for core portfolio assets
+  useEffect(() => {
+    return subscribeSimulatedTrades(() => {
+      setSimulatedTrades(loadSimulatedTrades());
+    });
+  }, []);
+
+  // Fetch live PHP/USDT conversion rate from CoinGecko
   useEffect(() => {
     let isMounted = true;
-    const coreSymbols = ['BTC', 'BNB', 'ETH', 'SOL'];
+    fetchCoinGeckoPhpRate(PHP_EXCHANGE_RATE).then((rate) => {
+      if (!isMounted) return;
+      setLivePhpRate(rate);
+      if (!taxPhpRateManuallyEdited) {
+        setTaxPhpRate(rate.toFixed(2));
+      }
+    });
+    return () => {
+      isMounted = false;
+    };
+  }, [taxPhpRateManuallyEdited]);
 
+  // Fetch 30-day daily historical prices from CoinGecko /coins/{id}/market_chart
+  useEffect(() => {
+    let isMounted = true;
+    const baseSymbols = ['BTC', 'BNB', 'ETH', 'SOL'];
+    const targetSymbols = Array.from(
+      new Set([
+        ...baseSymbols,
+        ...(chartAssetSymbol && chartAssetSymbol !== 'USDT' && chartAssetSymbol !== 'WCORE'
+          ? [chartAssetSymbol]
+          : []),
+      ])
+    );
+
+    const missingSymbols = targetSymbols.filter((sym) => !historicalSeries[sym]);
+    if (missingSymbols.length === 0) {
+      setIsLoadingHistory(false);
+      return;
+    }
+
+    setIsLoadingHistory(true);
     Promise.all(
-      coreSymbols.map(async (sym) => {
-        try {
-          const res = await fetch(
-            `/api/binance/klines?symbol=${encodeURIComponent(sym + 'USDT')}&interval=1d&limit=30`
-          );
-          if (!res.ok) return { sym, closes: [] as number[] };
-          const rows = await res.json();
-          if (!Array.isArray(rows)) return { sym, closes: [] as number[] };
-          const closes = rows
-            .map((r: any) => parseFloat(r?.[4]))
-            .filter((n: number) => !isNaN(n) && n > 0);
-          return { sym, closes };
-        } catch {
-          return { sym, closes: [] as number[] };
-        }
+      missingSymbols.map(async (sym) => {
+        const pts = await fetchCoinGeckoMarketChart(sym, 30, 'usd');
+        return { sym, pts };
       })
     ).then((results) => {
       if (!isMounted) return;
-      const map: Record<string, number[]> = {};
-      results.forEach(({ sym, closes }) => {
-        if (closes.length >= 7) {
-          map[sym] = closes;
-        }
+      setHistoricalSeries((prev) => {
+        const next = { ...prev };
+        let changed = false;
+        results.forEach(({ sym, pts }) => {
+          if (pts.length >= 2) {
+            const byDate: Record<string, number> = {};
+            pts.forEach((p) => {
+              byDate[p.dateKey] = p.price;
+            });
+            next[sym] = { byDate, points: pts };
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
       });
-      if (Object.keys(map).length > 0) {
-        setHistoricalDailyCloses(map);
-      }
+      setIsLoadingHistory(false);
     });
 
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [chartAssetSymbol, historicalSeries]);
 
   const getLiveAssetPrice = (symbol: string): number => {
     if (symbol === 'USDT') return 1.0;
@@ -185,7 +261,38 @@ export function PortfolioDashboard({
     [allocation]
   );
 
-  // Build 30-day daily portfolio valuation series
+  // Helper to resolve CoinGecko historical price for a given day index & dateKey
+  const getHistoricalPriceForDay = (
+    symbol: string,
+    dateKey: string,
+    dayIndex: number,
+    totalDays: number,
+    livePrice: number
+  ): number => {
+    if (dayIndex === totalDays - 1) return livePrice;
+    const entry = historicalSeries[symbol];
+    if (entry) {
+      if (entry.byDate[dateKey]) return entry.byDate[dateKey];
+      const pts = entry.points;
+      if (pts.length > 0) {
+        const idx = Math.min(
+          pts.length - 1,
+          Math.max(0, pts.length - totalDays + dayIndex)
+        );
+        return pts[idx]?.price || livePrice;
+      }
+    }
+    // Deterministic trajectory anchored to live price if CoinGecko series unavailable (e.g. WCORE)
+    const seed = symbol.charCodeAt(0) * 13 + (symbol.charCodeAt(1) || 7);
+    const progress = dayIndex / (totalDays - 1);
+    const trendFactor = 0.88 + 0.12 * progress;
+    const wave1 = Math.sin(dayIndex * 0.42 + seed) * 0.026 * (1 - progress * 0.25);
+    const wave2 = Math.cos(dayIndex * 0.85 + seed * 0.5) * 0.014 * (1 - progress * 0.25);
+    const multiplier = Math.max(0.65, trendFactor + wave1 + wave2);
+    return livePrice * multiplier;
+  };
+
+  // Build 30-day daily portfolio valuation series (CoinGecko market_chart powered)
   const history30d: PortfolioHistoryPoint[] = useMemo(() => {
     const totalDays = 30;
     const now = new Date();
@@ -195,6 +302,7 @@ export function PortfolioDashboard({
       const daysAgo = totalDays - 1 - i;
       const d = new Date(now);
       d.setDate(now.getDate() - daysAgo);
+      const dateKey = d.toISOString().slice(0, 10);
 
       const shortDate = d.toLocaleDateString('en-US', {
         month: 'short',
@@ -217,56 +325,25 @@ export function PortfolioDashboard({
         }
 
         const livePrice = getLiveAssetPrice(h.symbol);
-        const klineCloses = historicalDailyCloses[h.symbol];
-
-        if (i === totalDays - 1) {
-          // Today uses exact real-time Binance price
-          dayTotalUsdt += h.quantity * livePrice;
-        } else if (klineCloses && klineCloses.length > 0) {
-          const idx = Math.max(0, klineCloses.length - totalDays + i);
-          const histPrice = klineCloses[idx] || livePrice;
-          dayTotalUsdt += h.quantity * histPrice;
-        } else {
-          // Deterministic realistic 30-day trajectory anchored to live price on day 29
-          const seed = h.symbol.charCodeAt(0) * 13 + (h.symbol.charCodeAt(1) || 7);
-          const progress = i / (totalDays - 1); // 0 -> 1
-          const trendFactor = 0.88 + 0.12 * progress;
-          const wave1 = Math.sin(i * 0.42 + seed) * 0.026 * (1 - progress * 0.25);
-          const wave2 = Math.cos(i * 0.85 + seed * 0.5) * 0.014 * (1 - progress * 0.25);
-          const multiplier = Math.max(0.65, trendFactor + wave1 + wave2);
-          dayTotalUsdt += h.quantity * livePrice * multiplier;
-        }
+        const dayPrice = getHistoricalPriceForDay(h.symbol, dateKey, i, totalDays, livePrice);
+        dayTotalUsdt += h.quantity * dayPrice;
       });
 
       const prevValue = i > 0 ? points[i - 1].valueUsdt : dayTotalUsdt;
       const dailyChangePct =
         prevValue > 0 ? ((dayTotalUsdt - prevValue) / prevValue) * 100 : 0;
 
-      const btcCloses = historicalDailyCloses['BTC'];
-      const bnbCloses = historicalDailyCloses['BNB'];
       const btcLive = getLiveAssetPrice('BTC');
       const bnbLive = getLiveAssetPrice('BNB');
-
-      const btcPrice =
-        i === totalDays - 1
-          ? btcLive
-          : btcCloses && btcCloses.length > 0
-          ? btcCloses[Math.max(0, btcCloses.length - totalDays + i)] || btcLive
-          : btcLive * (0.89 + (0.11 * i) / (totalDays - 1));
-
-      const bnbPrice =
-        i === totalDays - 1
-          ? bnbLive
-          : bnbCloses && bnbCloses.length > 0
-          ? bnbCloses[Math.max(0, bnbCloses.length - totalDays + i)] || bnbLive
-          : bnbLive * (0.91 + (0.09 * i) / (totalDays - 1));
+      const btcPrice = getHistoricalPriceForDay('BTC', dateKey, i, totalDays, btcLive);
+      const bnbPrice = getHistoricalPriceForDay('BNB', dateKey, i, totalDays, bnbLive);
 
       points.push({
         date: shortDate,
         fullDate,
         dayIndex: i,
         valueUsdt: Number(dayTotalUsdt.toFixed(2)),
-        valuePhp: Number((dayTotalUsdt * PHP_EXCHANGE_RATE).toFixed(2)),
+        valuePhp: Number((dayTotalUsdt * livePhpRate).toFixed(2)),
         dailyChangePct: Number(dailyChangePct.toFixed(2)),
         btcPrice,
         bnbPrice,
@@ -274,11 +351,62 @@ export function PortfolioDashboard({
     }
 
     return points;
-  }, [holdings, assets, historicalDailyCloses]);
+  }, [holdings, assets, historicalSeries, livePhpRate]);
+
+  // Build 30-day Asset Price History series for selected coin (CoinGecko market_chart)
+  const assetHistory30d = useMemo(() => {
+    const totalDays = 30;
+    const now = new Date();
+    const livePrice = getLiveAssetPrice(chartAssetSymbol) || 1;
+    const points: Array<{
+      date: string;
+      fullDate: string;
+      priceUsdt: number;
+      pricePhp: number;
+      dailyChangePct: number;
+    }> = [];
+
+    for (let i = 0; i < totalDays; i++) {
+      const daysAgo = totalDays - 1 - i;
+      const d = new Date(now);
+      d.setDate(now.getDate() - daysAgo);
+      const dateKey = d.toISOString().slice(0, 10);
+
+      const shortDate = d.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+      });
+      const fullDate = d.toLocaleDateString('en-US', {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+
+      const priceUsdt = getHistoricalPriceForDay(chartAssetSymbol, dateKey, i, totalDays, livePrice);
+      const prev = i > 0 ? points[i - 1].priceUsdt : priceUsdt;
+      const dailyChangePct = prev > 0 ? ((priceUsdt - prev) / prev) * 100 : 0;
+
+      points.push({
+        date: shortDate,
+        fullDate,
+        priceUsdt,
+        pricePhp: priceUsdt * livePhpRate,
+        dailyChangePct: Number(dailyChangePct.toFixed(2)),
+      });
+    }
+
+    return points;
+  }, [chartAssetSymbol, assets, historicalSeries, livePhpRate]);
 
   const visibleHistory = useMemo(
     () => history30d.slice(history30d.length - rangeDays),
     [history30d, rangeDays]
+  );
+
+  const visibleAssetHistory = useMemo(
+    () => assetHistory30d.slice(assetHistory30d.length - rangeDays),
+    [assetHistory30d, rangeDays]
   );
 
   const stats = useMemo(() => {
@@ -294,7 +422,7 @@ export function PortfolioDashboard({
       };
     }
 
-    const rate = currency === 'PHP' ? PHP_EXCHANGE_RATE : 1;
+    const rate = currency === 'PHP' ? livePhpRate : 1;
     const startVal = visibleHistory[0].valueUsdt * rate;
     const endVal = currentTotalUsdt * rate;
     const netPnl = endVal - startVal;
@@ -317,7 +445,18 @@ export function PortfolioDashboard({
       lowVal,
       isPositive: netPnl >= 0,
     };
-  }, [visibleHistory, currentTotalUsdt, currency]);
+  }, [visibleHistory, currentTotalUsdt, currency, livePhpRate]);
+
+  const assetStats = useMemo(() => {
+    if (visibleAssetHistory.length === 0) {
+      return { startVal: 0, endVal: 0, deltaPct: 0, isPositive: true };
+    }
+    const key = currency === 'PHP' ? 'pricePhp' : 'priceUsdt';
+    const startVal = visibleAssetHistory[0][key];
+    const endVal = visibleAssetHistory[visibleAssetHistory.length - 1][key];
+    const deltaPct = startVal > 0 ? ((endVal - startVal) / startVal) * 100 : 0;
+    return { startVal, endVal, deltaPct, isPositive: deltaPct >= 0 };
+  }, [visibleAssetHistory, currency]);
 
   const currencySymbol = currency === 'PHP' ? '₱' : '$';
   const dataKey = currency === 'PHP' ? 'valuePhp' : 'valueUsdt';
@@ -354,7 +493,59 @@ export function PortfolioDashboard({
 
   const resetHoldingsToDefault = () => {
     setHoldings(DEFAULT_HOLDINGS);
+    setPreviousHoldings(null);
     setIsEditingHoldings(false);
+  };
+
+  const handleApplySimulatedRebalance = (nextHoldings: PortfolioHolding[]) => {
+    setPreviousHoldings(holdings);
+    setHoldings(nextHoldings);
+  };
+
+  const handleUndoSimulatedRebalance = () => {
+    if (!previousHoldings) return;
+    setHoldings(previousHoldings);
+    setPreviousHoldings(null);
+  };
+
+  // Compute Philippine Crypto Tax Summary from simulated trading history
+  const parsedTaxPhpRate = useMemo(() => {
+    const val = parseFloat(taxPhpRate);
+    return !isNaN(val) && val > 0 ? val : livePhpRate;
+  }, [taxPhpRate, livePhpRate]);
+
+  const phTaxOptions = useMemo(
+    () => ({
+      phpRate: parsedTaxPhpRate,
+      costBasisMethod,
+      taxYear,
+      statusFilter: taxStatusFilter,
+    }),
+    [parsedTaxPhpRate, costBasisMethod, taxYear, taxStatusFilter]
+  );
+
+  const phTaxSummary = useMemo(
+    () => computePhTaxSummary(simulatedTrades, phTaxOptions),
+    [simulatedTrades, phTaxOptions]
+  );
+
+  const formatPhp = (val: number) => {
+    if (hideBalances) return '••••••••';
+    const abs = Math.abs(val).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    return `${val < 0 ? '-' : ''}₱${abs}`;
+  };
+
+  const handleDownloadTaxCsv = () => {
+    const currentUser = auth.currentUser;
+    const accountLabel = currentUser
+      ? `${currentUser.displayName || 'Trader'} (${currentUser.email || currentUser.uid})`
+      : 'BINANCEPH Demo / Preview Account';
+    const filename = downloadPhTaxCsv(phTaxSummary, phTaxOptions, accountLabel);
+    setLastDownloadedFile(filename);
+    setTimeout(() => setLastDownloadedFile(null), 4500);
   };
 
   return (
@@ -368,6 +559,10 @@ export function PortfolioDashboard({
             </div>
             <span className="text-xs font-bold uppercase tracking-widest text-zinc-400">
               Estimated Portfolio Value ({rangeDays}D Performance)
+            </span>
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-[10px] font-mono font-bold uppercase tracking-wider">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              CoinGecko API · ₱{livePhpRate.toFixed(2)}/USDT
             </span>
             <button
               type="button"
@@ -461,6 +656,38 @@ export function PortfolioDashboard({
           >
             <SlidersHorizontal className="w-3.5 h-3.5 mr-1.5 text-yellow-500" />
             <span>{isEditingHoldings ? 'Close Editor' : 'Edit Holdings'}</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setShowRebalancePanel((prev) => !prev)}
+            className={`h-8 px-3 text-xs font-bold transition-colors ${
+              showRebalancePanel
+                ? 'border-cyan-500/60 bg-cyan-500/15 text-cyan-300 hover:bg-cyan-500/25'
+                : 'border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300'
+            }`}
+            title="Simulate AI Portfolio Rebalance Strategy with Gemini"
+          >
+            <Sparkles className="w-3.5 h-3.5 mr-1.5 text-cyan-400" />
+            <span>AI Rebalance</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setShowTaxPanel((prev) => !prev)}
+            className={`h-8 px-3 text-xs font-bold transition-colors ${
+              showTaxPanel
+                ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/20'
+                : 'border-zinc-800 bg-zinc-900 hover:bg-zinc-800 text-zinc-200'
+            }`}
+            title="Generate Philippine Crypto Tax Summary CSV from Simulated Trades"
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 mr-1.5 text-emerald-400" />
+            <span>PH Tax CSV</span>
           </Button>
 
           {compact && onOpenFullDashboard && (
@@ -559,6 +786,289 @@ export function PortfolioDashboard({
         </div>
       )}
 
+      {/* Philippine Crypto Tax CSV Summary Generator */}
+      {showTaxPanel && (
+        <div className="p-4 sm:p-6 bg-zinc-900/45 border-b border-zinc-800 space-y-5">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="w-7 h-7 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                  <Calculator className="w-3.5 h-3.5" />
+                </div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-zinc-100">
+                  Philippine Crypto Tax Summary (BIR Prep)
+                </h3>
+                <span className="text-[10px] font-mono font-bold uppercase px-2 py-0.5 rounded bg-yellow-500/10 text-yellow-500 border border-yellow-500/20">
+                  Simulated History · PHP (₱)
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400">
+                Export your simulated trading history converted to Philippine Pesos (PHT / UTC+8) with {costBasisMethod} cost-basis &amp; realized gain/loss calculations.
+              </p>
+            </div>
+
+            {/* Export Controls */}
+            <div className="flex flex-wrap items-center gap-2.5">
+              {/* Cost Basis Method */}
+              <div className="flex items-center bg-zinc-950 p-1 rounded-lg border border-zinc-800">
+                {(['FIFO', 'AVERAGE'] as const).map((method) => (
+                  <button
+                    key={method}
+                    type="button"
+                    onClick={() => setCostBasisMethod(method)}
+                    className={`px-2.5 py-1 rounded text-[11px] font-mono font-bold transition-colors ${
+                      costBasisMethod === method
+                        ? 'bg-zinc-800 text-yellow-500 border border-yellow-500/30'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    {method === 'FIFO' ? 'FIFO' : 'Avg Cost'}
+                  </button>
+                ))}
+              </div>
+
+              {/* Status Filter */}
+              <div className="flex items-center bg-zinc-950 p-1 rounded-lg border border-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => setTaxStatusFilter('filled_only')}
+                  className={`px-2.5 py-1 rounded text-[11px] font-bold transition-colors ${
+                    taxStatusFilter === 'filled_only'
+                      ? 'bg-emerald-500/20 text-emerald-400'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Filled Only
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTaxStatusFilter('all')}
+                  className={`px-2.5 py-1 rounded text-[11px] font-bold transition-colors ${
+                    taxStatusFilter === 'all'
+                      ? 'bg-zinc-800 text-zinc-100'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  All Orders
+                </button>
+              </div>
+
+              {/* Year Filter */}
+              <select
+                aria-label="Tax Year Filter"
+                value={taxYear}
+                onChange={(e) => setTaxYear(e.target.value)}
+                className="h-8 px-2.5 rounded-lg bg-zinc-950 border border-zinc-800 text-xs font-mono font-bold text-zinc-200 focus:outline-none focus:border-yellow-500/50"
+              >
+                <option value="ALL">All Years</option>
+                {phTaxSummary.availableYears.map((yr) => (
+                  <option key={yr} value={yr}>
+                    {yr}
+                  </option>
+                ))}
+              </select>
+
+              {/* Editable PHP/USDT FX Rate */}
+              <div className="flex items-center gap-1.5 bg-zinc-950 border border-zinc-800 rounded-lg px-2.5 h-8">
+                <span className="text-[10px] font-bold uppercase text-zinc-500">
+                  ₱/USDT
+                </span>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="1"
+                  aria-label="PHP per USDT Exchange Rate"
+                  value={taxPhpRate}
+                  onChange={(e) => {
+                    setTaxPhpRateManuallyEdited(true);
+                    setTaxPhpRate(e.target.value);
+                  }}
+                  className="w-14 bg-transparent text-xs font-mono font-bold text-yellow-500 focus:outline-none text-right"
+                />
+              </div>
+
+              {/* Primary Download CSV Button */}
+              <Button
+                type="button"
+                size="sm"
+                onClick={handleDownloadTaxCsv}
+                disabled={phTaxSummary.rows.length === 0}
+                className="h-8 px-3.5 bg-emerald-500 hover:bg-emerald-600 text-black font-black text-xs shadow-lg shadow-emerald-950/40"
+              >
+                <Download className="w-3.5 h-3.5 mr-1.5" />
+                <span>Download Tax CSV</span>
+              </Button>
+            </div>
+          </div>
+
+          {lastDownloadedFile && (
+            <div className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs font-mono flex items-center justify-between">
+              <span className="flex items-center gap-2">
+                <Check className="w-4 h-4 shrink-0" />
+                Exported <strong className="text-emerald-300">{lastDownloadedFile}</strong> ({phTaxSummary.rows.length} rows)
+              </span>
+            </div>
+          )}
+
+          {/* 4 Tax Summary KPIs in PHP */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="p-3 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 block">
+                Acquisitions ({phTaxSummary.filledBuyCount} Buys)
+              </span>
+              <span className="text-sm sm:text-base font-mono font-bold text-zinc-100 tabular-nums">
+                {formatPhp(phTaxSummary.totalAcquisitionsPhp)}
+              </span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 block">
+                Disposal Proceeds ({phTaxSummary.filledSellCount} Sells)
+              </span>
+              <span className="text-sm sm:text-base font-mono font-bold text-zinc-100 tabular-nums">
+                {formatPhp(phTaxSummary.totalDisposalsProceedsPhp)}
+              </span>
+            </div>
+
+            <div className="p-3 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 block">
+                Cost Basis &amp; Fees ({costBasisMethod})
+              </span>
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="text-sm sm:text-base font-mono font-bold text-zinc-200 tabular-nums">
+                  {formatPhp(phTaxSummary.totalDisposalsCostBasisPhp)}
+                </span>
+                <span className="text-[10px] font-mono text-zinc-500">
+                  Fees: {formatPhp(phTaxSummary.totalFeesPhp)}
+                </span>
+              </div>
+            </div>
+
+            <div className="p-3 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-1">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-500 block">
+                Est. Net Realized Gain / Loss
+              </span>
+              <span
+                className={`text-sm sm:text-base font-mono font-black tabular-nums ${
+                  phTaxSummary.netRealizedGainLossPhp >= 0
+                    ? 'text-emerald-400'
+                    : 'text-red-400'
+                }`}
+              >
+                {phTaxSummary.netRealizedGainLossPhp >= 0 && !hideBalances ? '+' : ''}
+                {formatPhp(phTaxSummary.netRealizedGainLossPhp)}
+              </span>
+            </div>
+          </div>
+
+          {/* Preview Table of Exportable Tax Rows */}
+          <div className="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-950/80 max-h-[240px]">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead className="bg-zinc-950 sticky top-0 border-b border-zinc-800 text-[10px] font-bold uppercase tracking-wider text-zinc-500">
+                <tr>
+                  <th className="py-2 px-3">ID / Time (PHT)</th>
+                  <th className="py-2 px-3">Pair</th>
+                  <th className="py-2 px-3">Side</th>
+                  <th className="py-2 px-3 text-right">Qty</th>
+                  <th className="py-2 px-3 text-right">Gross (PHP)</th>
+                  <th className="py-2 px-3 text-right">Fee (PHP)</th>
+                  <th className="py-2 px-3 text-right">Cost Basis (PHP)</th>
+                  <th className="py-2 px-3 text-right">Realized G/L (PHP)</th>
+                  <th className="py-2 px-3">Tax Event</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-zinc-800/60 font-mono">
+                {phTaxSummary.rows.map((row) => (
+                  <tr key={row.tradeId} className="hover:bg-zinc-900/60 transition-colors">
+                    <td className="py-2 px-3">
+                      <div className="text-zinc-200 font-bold text-[11px]">{row.tradeId}</div>
+                      <div className="text-zinc-500 text-[10px]">{row.dateTimePht}</div>
+                    </td>
+                    <td className="py-2 px-3 font-sans font-bold text-zinc-200">
+                      {row.pair}
+                      <span className="ml-1.5 text-[10px] font-mono text-zinc-500">
+                        {row.orderType}
+                      </span>
+                    </td>
+                    <td className="py-2 px-3">
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                          row.side === 'Buy'
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-red-500/15 text-red-400'
+                        }`}
+                      >
+                        {row.side}
+                      </span>
+                    </td>
+                    <td className="py-2 px-3 text-right text-zinc-300 tabular-nums">
+                      {row.quantity}
+                    </td>
+                    <td className="py-2 px-3 text-right text-zinc-200 tabular-nums">
+                      {formatPhp(row.grossTotalPhp)}
+                    </td>
+                    <td className="py-2 px-3 text-right text-zinc-400 tabular-nums">
+                      {formatPhp(row.feePhp)}
+                    </td>
+                    <td className="py-2 px-3 text-right text-zinc-300 tabular-nums">
+                      {row.status === 'Filled' ? formatPhp(row.costBasisPhp) : '—'}
+                    </td>
+                    <td
+                      className={`py-2 px-3 text-right font-bold tabular-nums ${
+                        row.status !== 'Filled' || row.side === 'Buy'
+                          ? 'text-zinc-500'
+                          : row.realizedGainLossPhp >= 0
+                          ? 'text-emerald-400'
+                          : 'text-red-400'
+                      }`}
+                    >
+                      {row.status === 'Filled' && row.side === 'Sell'
+                        ? `${row.realizedGainLossPhp >= 0 && !hideBalances ? '+' : ''}${formatPhp(
+                            row.realizedGainLossPhp
+                          )}`
+                        : '—'}
+                    </td>
+                    <td className="py-2 px-3 font-sans text-[11px] text-zinc-400">
+                      {row.taxClassification}
+                    </td>
+                  </tr>
+                ))}
+
+                {phTaxSummary.rows.length === 0 && (
+                  <tr>
+                    <td colSpan={9} className="py-8 text-center text-zinc-500 font-sans">
+                      No simulated trades match the selected tax year and order status filter.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex items-start gap-2 text-[11px] text-zinc-500 bg-zinc-950/60 border border-zinc-800/80 rounded-xl px-3.5 py-2.5">
+            <Info className="w-3.5 h-3.5 text-yellow-500 shrink-0 mt-0.5" />
+            <span>
+              <strong>BIR Preparation Aid:</strong> Values are computed from your <strong>simulated</strong> BINANCEPH trading history using Asia/Manila (PHT) timestamps and ₱{parsedTaxPhpRate.toFixed(2)}/USDT. This CSV is for informational calculation only and does not constitute official BIR tax, accounting, or legal advice.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* AI Portfolio Rebalance Simulator (Gemini) */}
+      {showRebalancePanel && (
+        <PortfolioRebalanceSimulator
+          allocation={allocation}
+          assets={assets}
+          totalValueUsdt={currentTotalUsdt}
+          phpRate={livePhpRate}
+          currency={currency}
+          hideBalances={hideBalances}
+          onApplyRebalance={handleApplySimulatedRebalance}
+          hasPendingUndo={previousHoldings !== null}
+          onUndoRebalance={handleUndoSimulatedRebalance}
+        />
+      )}
+
       {/* Collapsible Body */}
       {!isCollapsed && (
         <div className="p-4 sm:p-6 space-y-6">
@@ -606,111 +1116,263 @@ export function PortfolioDashboard({
             </div>
           </div>
 
-          {/* Recharts 30-Day AreaChart */}
-          <div className="w-full h-[240px] sm:h-[300px] bg-zinc-900/20 border border-zinc-900 rounded-2xl p-3 sm:p-4">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart
-                data={visibleHistory}
-                margin={{ top: 10, right: 12, left: 4, bottom: 0 }}
-              >
-                <defs>
-                  <linearGradient id="portfolioValueGradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={strokeColor} stopOpacity={0.35} />
-                    <stop offset="60%" stopColor={strokeColor} stopOpacity={0.1} />
-                    <stop offset="95%" stopColor={strokeColor} stopOpacity={0.0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  vertical={false}
-                  stroke="#27272a"
-                  opacity={0.6}
-                />
-                <XAxis
-                  dataKey="date"
-                  stroke="#71717a"
-                  fontSize={11}
-                  tickLine={false}
-                  axisLine={false}
-                  minTickGap={24}
-                />
-                <YAxis
-                  stroke="#71717a"
-                  fontSize={11}
-                  tickLine={false}
-                  axisLine={false}
-                  width={78}
-                  domain={['auto', 'auto']}
-                  tickFormatter={(value: number) => {
-                    if (hideBalances) return '•••';
-                    if (value >= 1_000_000) {
-                      return `${currencySymbol}${(value / 1_000_000).toFixed(2)}M`;
-                    }
-                    if (value >= 1_000) {
-                      return `${currencySymbol}${(value / 1_000).toFixed(1)}k`;
-                    }
-                    return `${currencySymbol}${value.toFixed(0)}`;
-                  }}
-                />
-                <Tooltip
-                  content={({ active, payload }) => {
-                    if (!active || !payload || !payload.length) return null;
-                    const point = payload[0].payload as PortfolioHistoryPoint;
-                    const val = currency === 'PHP' ? point.valuePhp : point.valueUsdt;
-                    const isDayPos = point.dailyChangePct >= 0;
+          {/* Recharts 30-Day Historical Performance / CoinGecko Price Chart Widget */}
+          <div className="bg-zinc-900/20 border border-zinc-900 rounded-2xl p-3 sm:p-4 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="flex items-center bg-zinc-950 p-1 rounded-lg border border-zinc-800">
+                  <button
+                    type="button"
+                    onClick={() => setChartMode('portfolio')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-bold transition-colors ${
+                      chartMode === 'portfolio'
+                        ? 'bg-yellow-500 text-black'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Portfolio Performance ({rangeDays}D)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChartMode('asset')}
+                    className={`px-2.5 py-1 rounded text-[11px] font-bold transition-colors ${
+                      chartMode === 'asset'
+                        ? 'bg-emerald-500 text-black'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Historical Coin Price ({rangeDays}D)
+                  </button>
+                </div>
 
-                    return (
-                      <div className="bg-zinc-950/95 border border-zinc-800 rounded-xl p-3.5 shadow-2xl backdrop-blur-md space-y-1.5 min-w-[210px]">
-                        <div className="flex items-center justify-between text-[11px] text-zinc-400">
-                          <span className="flex items-center gap-1.5">
-                            <Calendar className="w-3 h-3 text-yellow-500" />
-                            {point.fullDate}
-                          </span>
-                        </div>
-                        <div className="text-base font-black font-mono text-zinc-100 tabular-nums">
-                          {hideBalances
-                            ? '••••••••'
-                            : `${currencySymbol}${val.toLocaleString('en-US', {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              })} ${currency}`}
-                        </div>
-                        <div className="flex items-center justify-between text-xs font-mono pt-1 border-t border-zinc-800/80">
-                          <span className="text-zinc-500">24h Delta:</span>
-                          <span
-                            className={`font-bold ${
-                              isDayPos ? 'text-emerald-400' : 'text-red-400'
-                            }`}
-                          >
-                            {isDayPos ? '+' : ''}
-                            {point.dailyChangePct.toFixed(2)}%
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
-                          <span>BTC Ref: ${formatPrice(point.btcPrice)}</span>
-                          <span>BNB Ref: ${formatPrice(point.bnbPrice)}</span>
-                        </div>
-                      </div>
-                    );
-                  }}
-                />
-                <ReferenceLine
-                  y={stats.startVal}
-                  stroke="#52525b"
-                  strokeDasharray="4 4"
-                  ifOverflow="extendDomain"
-                />
-                <Area
-                  type="monotone"
-                  dataKey={dataKey}
-                  stroke={strokeColor}
-                  strokeWidth={2.5}
-                  fillOpacity={1}
-                  fill="url(#portfolioValueGradient)"
-                  animationDuration={600}
-                />
-              </AreaChart>
-            </ResponsiveContainer>
+                {chartMode === 'asset' && (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'DOGE'].map((sym) => (
+                      <button
+                        key={sym}
+                        type="button"
+                        onClick={() => setChartAssetSymbol(sym)}
+                        className={`px-2 py-1 rounded text-[11px] font-mono font-bold border transition-colors ${
+                          chartAssetSymbol === sym
+                            ? 'bg-zinc-800 border-emerald-500/50 text-emerald-400'
+                            : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        {sym}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-400">
+                {chartMode === 'asset' && (
+                  <span className={assetStats.isPositive ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold'}>
+                    {chartAssetSymbol}: {currencySymbol}
+                    {formatPrice(assetStats.endVal)} ({assetStats.isPositive ? '+' : ''}
+                    {assetStats.deltaPct.toFixed(2)}% / {rangeDays}d)
+                  </span>
+                )}
+                <span className="text-zinc-500">
+                  {isLoadingHistory ? 'Syncing CoinGecko…' : 'Source: CoinGecko /market_chart'}
+                </span>
+              </div>
+            </div>
+
+            <div className="w-full h-[240px] sm:h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                {chartMode === 'portfolio' ? (
+                  <AreaChart
+                    data={visibleHistory}
+                    margin={{ top: 10, right: 12, left: 4, bottom: 0 }}
+                  >
+                    <defs>
+                      <linearGradient id="portfolioValueGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={strokeColor} stopOpacity={0.35} />
+                        <stop offset="60%" stopColor={strokeColor} stopOpacity={0.1} />
+                        <stop offset="95%" stopColor={strokeColor} stopOpacity={0.0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      vertical={false}
+                      stroke="#27272a"
+                      opacity={0.6}
+                    />
+                    <XAxis
+                      dataKey="date"
+                      stroke="#71717a"
+                      fontSize={11}
+                      tickLine={false}
+                      axisLine={false}
+                      minTickGap={24}
+                    />
+                    <YAxis
+                      stroke="#71717a"
+                      fontSize={11}
+                      tickLine={false}
+                      axisLine={false}
+                      width={78}
+                      domain={['auto', 'auto']}
+                      tickFormatter={(value: number) => {
+                        if (hideBalances) return '•••';
+                        if (value >= 1_000_000) {
+                          return `${currencySymbol}${(value / 1_000_000).toFixed(2)}M`;
+                        }
+                        if (value >= 1_000) {
+                          return `${currencySymbol}${(value / 1_000).toFixed(1)}k`;
+                        }
+                        return `${currencySymbol}${value.toFixed(0)}`;
+                      }}
+                    />
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (!active || !payload || !payload.length) return null;
+                        const point = payload[0].payload as PortfolioHistoryPoint;
+                        const val = currency === 'PHP' ? point.valuePhp : point.valueUsdt;
+                        const isDayPos = point.dailyChangePct >= 0;
+
+                        return (
+                          <div className="bg-zinc-950/95 border border-zinc-800 rounded-xl p-3.5 shadow-2xl backdrop-blur-md space-y-1.5 min-w-[210px]">
+                            <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                              <span className="flex items-center gap-1.5">
+                                <Calendar className="w-3 h-3 text-yellow-500" />
+                                {point.fullDate}
+                              </span>
+                            </div>
+                            <div className="text-base font-black font-mono text-zinc-100 tabular-nums">
+                              {hideBalances
+                                ? '••••••••'
+                                : `${currencySymbol}${val.toLocaleString('en-US', {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  })} ${currency}`}
+                            </div>
+                            <div className="flex items-center justify-between text-xs font-mono pt-1 border-t border-zinc-800/80">
+                              <span className="text-zinc-500">24h Delta:</span>
+                              <span
+                                className={`font-bold ${
+                                  isDayPos ? 'text-emerald-400' : 'text-red-400'
+                                }`}
+                              >
+                                {isDayPos ? '+' : ''}
+                                {point.dailyChangePct.toFixed(2)}%
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+                              <span>BTC: ${formatPrice(point.btcPrice)}</span>
+                              <span>BNB: ${formatPrice(point.bnbPrice)}</span>
+                            </div>
+                          </div>
+                        );
+                      }}
+                    />
+                    <ReferenceLine
+                      y={stats.startVal}
+                      stroke="#52525b"
+                      strokeDasharray="4 4"
+                      ifOverflow="extendDomain"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey={dataKey}
+                      stroke={strokeColor}
+                      strokeWidth={2.5}
+                      fillOpacity={1}
+                      fill="url(#portfolioValueGradient)"
+                      animationDuration={600}
+                    />
+                  </AreaChart>
+                ) : (
+                  <AreaChart
+                    data={visibleAssetHistory}
+                    margin={{ top: 10, right: 12, left: 4, bottom: 0 }}
+                  >
+                    <defs>
+                      <linearGradient id="assetHistoryGradient" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={assetStats.isPositive ? '#10B981' : '#EF4444'} stopOpacity={0.35} />
+                        <stop offset="60%" stopColor={assetStats.isPositive ? '#10B981' : '#EF4444'} stopOpacity={0.1} />
+                        <stop offset="95%" stopColor={assetStats.isPositive ? '#10B981' : '#EF4444'} stopOpacity={0.0} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid
+                      strokeDasharray="3 3"
+                      vertical={false}
+                      stroke="#27272a"
+                      opacity={0.6}
+                    />
+                    <XAxis
+                      dataKey="date"
+                      stroke="#71717a"
+                      fontSize={11}
+                      tickLine={false}
+                      axisLine={false}
+                      minTickGap={24}
+                    />
+                    <YAxis
+                      stroke="#71717a"
+                      fontSize={11}
+                      tickLine={false}
+                      axisLine={false}
+                      width={78}
+                      domain={['auto', 'auto']}
+                      tickFormatter={(value: number) => `${currencySymbol}${formatPrice(value)}`}
+                    />
+                    <Tooltip
+                      content={({ active, payload }) => {
+                        if (!active || !payload || !payload.length) return null;
+                        const point = payload[0].payload as {
+                          fullDate: string;
+                          priceUsdt: number;
+                          pricePhp: number;
+                          dailyChangePct: number;
+                        };
+                        const val = currency === 'PHP' ? point.pricePhp : point.priceUsdt;
+                        const isDayPos = point.dailyChangePct >= 0;
+
+                        return (
+                          <div className="bg-zinc-950/95 border border-zinc-800 rounded-xl p-3.5 shadow-2xl backdrop-blur-md space-y-1.5 min-w-[205px]">
+                            <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                              <span className="flex items-center gap-1.5">
+                                <Calendar className="w-3 h-3 text-emerald-400" />
+                                {point.fullDate}
+                              </span>
+                            </div>
+                            <div className="text-xs font-bold uppercase tracking-wider text-zinc-400">
+                              {chartAssetSymbol} Historical Price
+                            </div>
+                            <div className="text-base font-black font-mono text-zinc-100 tabular-nums">
+                              {currencySymbol}{formatPrice(val)} {currency}
+                            </div>
+                            <div className="flex items-center justify-between text-xs font-mono pt-1 border-t border-zinc-800/80">
+                              <span className="text-zinc-500">24h Delta:</span>
+                              <span className={`font-bold ${isDayPos ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {isDayPos ? '+' : ''}{point.dailyChangePct.toFixed(2)}%
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      }}
+                    />
+                    <ReferenceLine
+                      y={assetStats.startVal}
+                      stroke="#52525b"
+                      strokeDasharray="4 4"
+                      ifOverflow="extendDomain"
+                    />
+                    <Area
+                      type="monotone"
+                      dataKey={currency === 'PHP' ? 'pricePhp' : 'priceUsdt'}
+                      stroke={assetStats.isPositive ? '#10B981' : '#EF4444'}
+                      strokeWidth={2.5}
+                      fillOpacity={1}
+                      fill="url(#assetHistoryGradient)"
+                      animationDuration={600}
+                    />
+                  </AreaChart>
+                )}
+              </ResponsiveContainer>
+            </div>
           </div>
 
           {/* Asset Allocation Bar & Interactive Holdings Grid */}
@@ -720,7 +1382,7 @@ export function PortfolioDashboard({
                 Portfolio Allocation Breakdown
               </span>
               <span className="font-mono text-zinc-500">
-                Live Binance Spot Valuation
+                Live CoinGecko Spot Valuation
               </span>
             </div>
 
@@ -751,7 +1413,7 @@ export function PortfolioDashboard({
             {/* Holdings Cards */}
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-1">
               {allocation.map((item) => {
-                const rate = currency === 'PHP' ? PHP_EXCHANGE_RATE : 1;
+                const rate = currency === 'PHP' ? livePhpRate : 1;
                 const displayVal = item.valueUsdt * rate;
 
                 return (

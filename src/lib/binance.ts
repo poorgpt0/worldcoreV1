@@ -8,6 +8,13 @@ export interface Asset {
   volume: string;
   high24h?: number;
   low24h?: number;
+  coingeckoId?: string;
+  image?: string;
+  marketCap?: number;
+  marketCapRank?: number;
+  sparkline7d?: number[];
+  ath?: number;
+  change7d?: number;
 }
 
 export const KNOWN_CRYPTO_NAMES: Record<string, string> = {

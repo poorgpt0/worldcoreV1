@@ -3,17 +3,8 @@ import { Card } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { TrendingUp, TrendingDown, Search, ArrowUpDown } from 'lucide-react';
 import { Input } from '@/components/ui/input';
-import { formatPrice } from '@/lib/binance';
-
-export interface Asset {
-  symbol: string;
-  name: string;
-  price: number;
-  change: number;
-  volume: string;
-  high24h?: number;
-  low24h?: number;
-}
+import { formatPrice, Asset } from '@/lib/binance';
+export type { Asset };
 
 export function AssetList({ assets, onSelect }: { assets: Asset[], onSelect: (asset: Asset) => void }) {
   const [search, setSearch] = useState('');
@@ -91,8 +82,17 @@ export function AssetList({ assets, onSelect }: { assets: Asset[], onSelect: (as
               className="w-full flex items-center justify-between p-3 rounded-lg hover:bg-zinc-900 transition-colors group text-left"
             >
               <div className="flex items-center gap-3">
-                <div className="w-8 h-8 rounded-full bg-zinc-800 flex items-center justify-center font-bold text-xs text-yellow-500 group-hover:scale-110 transition-transform">
-                  {asset.symbol[0]}
+                <div className="w-8 h-8 rounded-full bg-zinc-800 flex items-center justify-center font-bold text-xs text-yellow-500 group-hover:scale-110 transition-transform overflow-hidden shrink-0">
+                  {asset.image ? (
+                    <img
+                      src={asset.image}
+                      alt={asset.symbol}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                  ) : (
+                    asset.symbol[0]
+                  )}
                 </div>
                 <div>
                   <div className="font-semibold text-zinc-100">{asset.symbol}</div>

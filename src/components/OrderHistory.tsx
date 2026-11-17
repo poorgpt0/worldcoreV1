@@ -1,154 +1,34 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Card } from '@/components/ui/card';
 import { History, Clock, CheckCircle2, XCircle, Filter, Search, RotateCcw } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { auth } from '../lib/firebase';
 import { formatPrice } from '@/lib/binance';
+import {
+  SimulatedTrade,
+  INITIAL_SIMULATED_TRADES,
+  loadSimulatedTrades,
+  updateSimulatedTradeStatus,
+  cancelAllOpenSimulatedTrades,
+  resetSimulatedTrades,
+  subscribeSimulatedTrades,
+} from '@/lib/simulatedTrades';
 
 export type OrderFilterTab = 'open' | 'filled' | 'canceled' | 'all';
-
-export interface Order {
-  id: string;
-  time: string;
-  asset: string;
-  type: 'Market' | 'Limit' | 'Stop-Limit';
-  side: 'Buy' | 'Sell';
-  price: number;
-  amount: number;
-  filled: number; // percentage 0 - 100
-  total: number;
-  status: 'Open' | 'Filled' | 'Canceled';
-}
-
-const INITIAL_ORDERS: Order[] = [
-  {
-    id: 'ORD-9048',
-    time: '2026-10-06 05:42:18',
-    asset: 'BTC',
-    type: 'Limit',
-    side: 'Buy',
-    price: 85400.00,
-    amount: 0.15,
-    filled: 40,
-    total: 12810.00,
-    status: 'Open',
-  },
-  {
-    id: 'ORD-9047',
-    time: '2026-10-06 05:19:04',
-    asset: 'ETH',
-    type: 'Limit',
-    side: 'Sell',
-    price: 2785.00,
-    amount: 2.5,
-    filled: 0,
-    total: 6962.50,
-    status: 'Open',
-  },
-  {
-    id: 'ORD-9046',
-    time: '2026-10-06 04:55:31',
-    asset: 'SOL',
-    type: 'Stop-Limit',
-    side: 'Buy',
-    price: 148.50,
-    amount: 25,
-    filled: 0,
-    total: 3712.50,
-    status: 'Open',
-  },
-  {
-    id: 'ORD-9041',
-    time: '2026-10-05 22:24:12',
-    asset: 'BTC',
-    type: 'Market',
-    side: 'Buy',
-    price: 86390.50,
-    amount: 0.08,
-    filled: 100,
-    total: 6911.24,
-    status: 'Filled',
-  },
-  {
-    id: 'ORD-9038',
-    time: '2026-10-05 18:30:00',
-    asset: 'SOL',
-    type: 'Market',
-    side: 'Buy',
-    price: 152.10,
-    amount: 15,
-    filled: 100,
-    total: 2281.50,
-    status: 'Filled',
-  },
-  {
-    id: 'ORD-9035',
-    time: '2026-10-05 15:11:44',
-    asset: 'BNB',
-    type: 'Limit',
-    side: 'Sell',
-    price: 612.80,
-    amount: 6.5,
-    filled: 100,
-    total: 3983.20,
-    status: 'Filled',
-  },
-  {
-    id: 'ORD-9031',
-    time: '2026-10-05 11:05:29',
-    asset: 'XRP',
-    type: 'Market',
-    side: 'Buy',
-    price: 0.584,
-    amount: 2500,
-    filled: 100,
-    total: 1460.00,
-    status: 'Filled',
-  },
-  {
-    id: 'ORD-9027',
-    time: '2026-10-04 19:20:12',
-    asset: 'BNB',
-    type: 'Limit',
-    side: 'Sell',
-    price: 625.00,
-    amount: 5,
-    filled: 0,
-    total: 3125.00,
-    status: 'Canceled',
-  },
-  {
-    id: 'ORD-9022',
-    time: '2026-10-04 14:08:53',
-    asset: 'ETH',
-    type: 'Limit',
-    side: 'Buy',
-    price: 2510.00,
-    amount: 1.8,
-    filled: 0,
-    total: 4518.00,
-    status: 'Canceled',
-  },
-  {
-    id: 'ORD-9019',
-    time: '2026-10-04 09:42:10',
-    asset: 'DOGE',
-    type: 'Stop-Limit',
-    side: 'Sell',
-    price: 0.165,
-    amount: 12000,
-    filled: 0,
-    total: 1980.00,
-    status: 'Canceled',
-  },
-];
+export type Order = SimulatedTrade;
 
 export function OrderHistory({ isVerified }: { isVerified: boolean }) {
   const user = auth.currentUser;
-  const [orders, setOrders] = useState<Order[]>(INITIAL_ORDERS);
+  const [orders, setOrders] = useState<Order[]>(() => loadSimulatedTrades());
   const [statusFilter, setStatusFilter] = useState<OrderFilterTab>('open');
   const [sideFilter, setSideFilter] = useState<'All' | 'Buy' | 'Sell'>('All');
   const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    return subscribeSimulatedTrades(() => {
+      setOrders(loadSimulatedTrades());
+    });
+  }, []);
 
   const counts = useMemo(() => {
     return {
@@ -177,19 +57,15 @@ export function OrderHistory({ isVerified }: { isVerified: boolean }) {
   }, [orders, statusFilter, sideFilter, searchQuery]);
 
   const handleCancelOrder = (orderId: string) => {
-    setOrders((prev) =>
-      prev.map((o) => (o.id === orderId ? { ...o, status: 'Canceled' } : o))
-    );
+    setOrders(updateSimulatedTradeStatus(orderId, 'Canceled'));
   };
 
   const handleCancelAllOpen = () => {
-    setOrders((prev) =>
-      prev.map((o) => (o.status === 'Open' ? { ...o, status: 'Canceled' } : o))
-    );
+    setOrders(cancelAllOpenSimulatedTrades());
   };
 
   const handleResetOrders = () => {
-    setOrders(INITIAL_ORDERS);
+    setOrders(resetSimulatedTrades());
   };
 
   return (
@@ -256,7 +132,7 @@ export function OrderHistory({ isVerified }: { isVerified: boolean }) {
               </button>
             )}
 
-            {counts.open < INITIAL_ORDERS.filter((o) => o.status === 'Open').length && (
+            {counts.open < INITIAL_SIMULATED_TRADES.filter((o) => o.status === 'Open').length && (
               <button
                 type="button"
                 onClick={handleResetOrders}

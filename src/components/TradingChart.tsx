@@ -5,6 +5,9 @@ import {
   CrosshairMode, 
   IChartApi, 
   ISeriesApi, 
+  ISeriesMarkersPluginApi,
+  SeriesMarker,
+  createSeriesMarkers,
   Time, 
   CandlestickSeries, 
   AreaSeries, 
@@ -26,16 +29,42 @@ import {
   EyeOff,
   Layers,
   ChevronDown,
-  Check
+  Check,
+  PanelBottom,
+  PictureInPicture2,
+  X
 } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip as RechartsTooltip,
+  ReferenceLine,
+  ReferenceArea,
+  CartesianGrid,
+} from 'recharts';
 import { fetchLiveBinanceKlines, KlinePoint, VolumePoint, formatPrice } from '@/lib/binance';
 import { 
   IndicatorType, 
+  RSICrossoverSignal,
   calculateRSI, 
+  detectRSICrossovers,
   calculateMACD, 
   calculateBollingerBands, 
   calculateEMA 
 } from '@/lib/indicators';
+
+export interface RechartsRSIPoint {
+  timeKey: string;
+  label: string;
+  fullTime: string;
+  rsi: number;
+  close: number;
+  momentumZone: 'Overbought' | 'Bullish' | 'Bearish' | 'Oversold';
+  signal?: 'buy' | 'sell';
+}
 
 export interface OHLCData {
   time: number | string;
@@ -91,14 +120,11 @@ export function TradingChart({
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | ISeriesApi<"Area"> | null>(null);
+  const markersPluginRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const lastRsiMarkersRef = useRef<SeriesMarker<Time>[]>([]);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   // Technical Indicator Series Refs
-  // RSI (14)
-  const rsiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const rsiOverboughtRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const rsiOversoldRef = useRef<ISeriesApi<"Line"> | null>(null);
-
   // MACD (12, 26, 9)
   const macdLineRef = useRef<ISeriesApi<"Line"> | null>(null);
   const macdSignalRef = useRef<ISeriesApi<"Line"> | null>(null);
@@ -132,6 +158,13 @@ export function TradingChart({
   // Technical Indicators State
   const [activeIndicators, setActiveIndicators] = useState<Set<IndicatorType>>(new Set(['rsi']));
   const [isIndicatorDropdownOpen, setIsIndicatorDropdownOpen] = useState(false);
+
+  // Recharts RSI Overlay & Crossover Markers State
+  const [rsiPeriod, setRsiPeriod] = useState<7 | 14 | 21>(14);
+  const [rsiLayout, setRsiLayout] = useState<'overlay' | 'docked'>('overlay');
+  const [rsiChartData, setRsiChartData] = useState<RechartsRSIPoint[]>([]);
+  const [showRsiSignals, setShowRsiSignals] = useState<boolean>(true);
+  const [rsiSignals, setRsiSignals] = useState<RSICrossoverSignal[]>([]);
 
   // Current Indicator Values for display
   const [indicatorValues, setIndicatorValues] = useState<{
@@ -215,7 +248,7 @@ export function TradingChart({
     });
   }, []);
 
-  // Recalculate and push data to active indicator series
+  // Recalculate and push data to active indicator series (including Recharts RSI data)
   const updateIndicatorSeries = useCallback((points: KlinePoint[]) => {
     if (!points || points.length === 0 || isDisposedRef.current || !chartRef.current) return;
 
@@ -226,22 +259,86 @@ export function TradingChart({
       ema?: { ema7: number; ema25: number; ema99: number };
     } = {};
 
-    // 1. RSI
+    // 1. RSI (rendered via Recharts Momentum Overlay + Buy/Sell Crossover Markers)
     if (activeIndicators.has('rsi')) {
-      const rsiData = calculateRSI(points, 14);
-      if (rsiSeriesRef.current && rsiData.length > 0) {
-        rsiSeriesRef.current.setData(rsiData);
-        const latestRSI = rsiData[rsiData.length - 1].value;
-        valuesToUpdate.rsi = latestRSI;
+      const rsiData = calculateRSI(points, rsiPeriod);
+      if (rsiData.length > 0) {
+        const signals = detectRSICrossovers(points, rsiData);
+        const signalByTime = new Map<string, 'buy' | 'sell'>();
+        signals.forEach((sig) => {
+          signalByTime.set(String(sig.time), sig.type);
+        });
 
-        // Draw guideline lines at 70 and 30
-        if (rsiOverboughtRef.current && rsiOversoldRef.current) {
-          const overbought = rsiData.map((d) => ({ time: d.time, value: 70 }));
-          const oversold = rsiData.map((d) => ({ time: d.time, value: 30 }));
-          rsiOverboughtRef.current.setData(overbought);
-          rsiOversoldRef.current.setData(oversold);
+        const offset = points.length - rsiData.length;
+        const formattedRsi: RechartsRSIPoint[] = rsiData.map((d, idx) => {
+          const sourcePoint = points[offset + idx];
+          const ts = formatTimestamp(d.time);
+          const rsiVal = d.value;
+          const momentumZone: RechartsRSIPoint['momentumZone'] =
+            rsiVal >= 70
+              ? 'Overbought'
+              : rsiVal <= 30
+              ? 'Oversold'
+              : rsiVal >= 50
+              ? 'Bullish'
+              : 'Bearish';
+
+          return {
+            timeKey: String(d.time),
+            label: ts.time.slice(0, 5),
+            fullTime: ts.full,
+            rsi: rsiVal,
+            close: sourcePoint ? sourcePoint.close ?? sourcePoint.value : 0,
+            momentumZone,
+            signal: signalByTime.get(String(d.time)),
+          };
+        });
+
+        const chartMarkers: SeriesMarker<Time>[] = showRsiSignals
+          ? signals.map((sig) =>
+              sig.type === 'buy'
+                ? {
+                    time: sig.time,
+                    position: 'belowBar',
+                    color: '#22c55e',
+                    shape: 'arrowUp',
+                    text: 'Buy',
+                  }
+                : {
+                    time: sig.time,
+                    position: 'aboveBar',
+                    color: '#ef4444',
+                    shape: 'arrowDown',
+                    text: 'Sell',
+                  }
+            )
+          : [];
+
+        lastRsiMarkersRef.current = chartMarkers;
+        try {
+          markersPluginRef.current?.setMarkers(chartMarkers);
+        } catch (err) {
+          console.warn('Failed to set RSI crossover markers:', err);
         }
+
+        setRsiSignals(signals);
+        setRsiChartData(formattedRsi);
+        valuesToUpdate.rsi = rsiData[rsiData.length - 1].value;
+      } else {
+        lastRsiMarkersRef.current = [];
+        try {
+          markersPluginRef.current?.setMarkers([]);
+        } catch {}
+        setRsiSignals([]);
+        setRsiChartData([]);
       }
+    } else {
+      lastRsiMarkersRef.current = [];
+      try {
+        markersPluginRef.current?.setMarkers([]);
+      } catch {}
+      setRsiSignals([]);
+      setRsiChartData([]);
     }
 
     // 2. MACD
@@ -290,58 +387,15 @@ export function TradingChart({
     }
 
     setIndicatorValues((prev) => ({ ...prev, ...valuesToUpdate }));
-  }, [activeIndicators]);
+  }, [activeIndicators, rsiPeriod, showRsiSignals]);
+
+  const updateIndicatorSeriesRef = useRef(updateIndicatorSeries);
+  updateIndicatorSeriesRef.current = updateIndicatorSeries;
 
   // Synchronize indicator chart series when active indicators change
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart || isDisposedRef.current) return;
-
-    // --- RSI Series Setup ---
-    if (activeIndicators.has('rsi')) {
-      if (!rsiSeriesRef.current) {
-        try {
-          const rsiSeries = chart.addSeries(LineSeries, {
-            color: '#c084fc', // purple-400
-            lineWidth: 2,
-            priceScaleId: 'rsi_scale',
-          });
-          const rsiOverbought = chart.addSeries(LineSeries, {
-            color: 'rgba(239, 68, 68, 0.4)', // red dashed
-            lineWidth: 1,
-            lineStyle: 2,
-            priceScaleId: 'rsi_scale',
-          });
-          const rsiOversold = chart.addSeries(LineSeries, {
-            color: 'rgba(34, 197, 94, 0.4)', // green dashed
-            lineWidth: 1,
-            lineStyle: 2,
-            priceScaleId: 'rsi_scale',
-          });
-
-          rsiSeries.priceScale().applyOptions({
-            scaleMargins: { top: 0.78, bottom: 0.02 },
-          });
-
-          rsiSeriesRef.current = rsiSeries;
-          rsiOverboughtRef.current = rsiOverbought;
-          rsiOversoldRef.current = rsiOversold;
-        } catch (e) {
-          console.warn("Failed to create RSI series:", e);
-        }
-      }
-    } else {
-      if (rsiSeriesRef.current) {
-        try {
-          chart.removeSeries(rsiSeriesRef.current);
-          if (rsiOverboughtRef.current) chart.removeSeries(rsiOverboughtRef.current);
-          if (rsiOversoldRef.current) chart.removeSeries(rsiOversoldRef.current);
-        } catch {}
-        rsiSeriesRef.current = null;
-        rsiOverboughtRef.current = null;
-        rsiOversoldRef.current = null;
-      }
-    }
 
     // --- MACD Series Setup ---
     if (activeIndicators.has('macd')) {
@@ -574,6 +628,9 @@ export function TradingChart({
         });
       }
       seriesRef.current = priceSeries;
+      if (priceSeries) {
+        markersPluginRef.current = createSeriesMarkers(priceSeries, lastRsiMarkersRef.current);
+      }
     } catch (e) {
       console.warn("Error adding price series:", e);
     }
@@ -671,11 +728,12 @@ export function TradingChart({
         }
       }
 
+      try {
+        markersPluginRef.current?.detach();
+      } catch {}
+      markersPluginRef.current = null;
       seriesRef.current = null;
       volumeSeriesRef.current = null;
-      rsiSeriesRef.current = null;
-      rsiOverboughtRef.current = null;
-      rsiOversoldRef.current = null;
       macdLineRef.current = null;
       macdSignalRef.current = null;
       macdHistRef.current = null;
@@ -725,7 +783,7 @@ export function TradingChart({
           lastBarTimeRef.current = lastPoint.time as number;
           lastPriceRef.current = lastPoint.close;
           updateLatestOHLC(finalPoints, finalVolPoints);
-          updateIndicatorSeries(finalPoints);
+          updateIndicatorSeriesRef.current(finalPoints);
         }
 
         try {
@@ -751,7 +809,7 @@ export function TradingChart({
         cachedPointsRef.current = fallback.points;
         cachedVolPointsRef.current = fallback.volPoints;
         updateLatestOHLC(fallback.points, fallback.volPoints);
-        updateIndicatorSeries(fallback.points);
+        updateIndicatorSeriesRef.current(fallback.points);
         if (seriesRef.current) {
           if (currentChartTypeRef.current === 'candlestick') {
             (seriesRef.current as ISeriesApi<"Candlestick">).setData(fallback.points as any);
@@ -767,7 +825,7 @@ export function TradingChart({
     return () => {
       isCancelled = true;
     };
-  }, [asset?.symbol, timeframe, generateFallbackData, updateLatestOHLC, updateIndicatorSeries]);
+  }, [asset?.symbol, timeframe, generateFallbackData, updateLatestOHLC]);
 
   // Connect to Binance live kline stream for the active symbol and timeframe
   useEffect(() => {
@@ -856,7 +914,7 @@ export function TradingChart({
                 } else {
                   existingPoints.push({ time: timeSec, open, high, low, close, value: close });
                 }
-                updateIndicatorSeries(existingPoints);
+                updateIndicatorSeriesRef.current(existingPoints);
               }
             }
           } catch {
@@ -890,7 +948,7 @@ export function TradingChart({
         ws.close();
       }
     };
-  }, [asset?.symbol, timeframe, updateIndicatorSeries]);
+  }, [asset?.symbol, timeframe]);
 
   // Handle chartType switch: safely swap price series without losing data
   useEffect(() => {
@@ -900,6 +958,10 @@ export function TradingChart({
     const oldSeries = seriesRef.current;
 
     try {
+      try {
+        markersPluginRef.current?.detach();
+      } catch {}
+      markersPluginRef.current = null;
       if (oldSeries) {
         chart.removeSeries(oldSeries);
       }
@@ -936,6 +998,7 @@ export function TradingChart({
           newSeries.setData(points.map(p => ({ time: p.time, value: p.value })));
         }
       }
+      markersPluginRef.current = createSeriesMarkers(newSeries, lastRsiMarkersRef.current);
     } catch (e) {
       console.warn("Error switching chart series type:", e);
     }
@@ -1050,8 +1113,289 @@ export function TradingChart({
     };
   };
 
+  const isRsiActive = activeIndicators.has('rsi');
+  const hoveredRsiPoint = hoveredOHLC
+    ? rsiChartData.find((p) => p.timeKey === String(hoveredOHLC.time))
+    : undefined;
+  const activeRsiPoint =
+    hoveredRsiPoint || (rsiChartData.length > 0 ? rsiChartData[rsiChartData.length - 1] : undefined);
+  const currentRsiValue = activeRsiPoint?.rsi ?? indicatorValues.rsi;
+
+  const getRsiZoneBadge = (val?: number) => {
+    if (val === undefined) {
+      return {
+        label: 'Syncing',
+        classes: 'bg-zinc-800 text-zinc-400 border-zinc-700',
+      };
+    }
+    if (val >= 70) {
+      return {
+        label: 'Overbought',
+        classes: 'bg-red-500/15 text-red-400 border-red-500/30',
+      };
+    }
+    if (val <= 30) {
+      return {
+        label: 'Oversold',
+        classes: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
+      };
+    }
+    if (val >= 50) {
+      return {
+        label: 'Bullish',
+        classes: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
+      };
+    }
+    return {
+      label: 'Bearish',
+      classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    };
+  };
+
+  const activeRsiBadge = getRsiZoneBadge(currentRsiValue);
+
+  const renderRechartsRsiOverlay = () => {
+    if (!isRsiActive) return null;
+
+    const isFloatingOverlay = rsiLayout === 'overlay';
+
+    return (
+      <div
+        className={
+          isFloatingOverlay
+            ? 'absolute bottom-2 left-2 right-2 z-20 h-[132px] rounded-xl bg-zinc-950/85 backdrop-blur-md border border-zinc-800/90 shadow-2xl px-3 py-2 flex flex-col'
+            : 'mt-2 shrink-0 h-[138px] rounded-xl bg-zinc-900/45 border border-zinc-800/90 px-3 py-2 flex flex-col'
+        }
+      >
+        {/* RSI Overlay Header */}
+        <div className="flex items-center justify-between gap-2 mb-1 shrink-0 flex-wrap">
+          <div className="flex items-center gap-2 font-mono text-[11px]">
+            <span className="w-2 h-2 rounded-full bg-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.8)]" />
+            <span className="font-bold text-zinc-200">RSI ({rsiPeriod})</span>
+            {currentRsiValue !== undefined && (
+              <span className="font-black text-purple-300 tabular-nums">
+                {currentRsiValue.toFixed(2)}
+              </span>
+            )}
+            <span
+              className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border ${activeRsiBadge.classes}`}
+            >
+              {activeRsiBadge.label}
+            </span>
+            {hoveredRsiPoint && (
+              <span className="hidden sm:inline text-[10px] text-zinc-500">
+                @ {hoveredRsiPoint.label}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {/* RSI Buy/Sell Crossover Markers Toggle */}
+            <button
+              type="button"
+              onClick={() => setShowRsiSignals((prev) => !prev)}
+              className={`px-1.5 py-0.5 rounded-md border text-[9px] font-mono font-bold transition-colors flex items-center gap-1 ${
+                showRsiSignals
+                  ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-300'
+                  : 'bg-zinc-950/80 border-zinc-800 text-zinc-500 hover:text-zinc-300'
+              }`}
+              title="Toggle Buy (RSI > 30) / Sell (RSI < 70) chart markers"
+            >
+              <span>Signals</span>
+              <span className="text-emerald-400">
+                {rsiSignals.filter((s) => s.type === 'buy').length}B
+              </span>
+              <span className="text-zinc-600">/</span>
+              <span className="text-red-400">
+                {rsiSignals.filter((s) => s.type === 'sell').length}S
+              </span>
+            </button>
+
+            {/* RSI Period Switcher */}
+            <div className="flex items-center bg-zinc-950/80 rounded-md p-0.5 border border-zinc-800">
+              {([7, 14, 21] as const).map((period) => (
+                <button
+                  key={period}
+                  type="button"
+                  onClick={() => setRsiPeriod(period)}
+                  className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold transition-colors ${
+                    rsiPeriod === period
+                      ? 'bg-purple-500/25 text-purple-300 border border-purple-500/40'
+                      : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                  title={`Set RSI Period to ${period}`}
+                >
+                  {period}
+                </button>
+              ))}
+            </div>
+
+            {/* Overlay vs Docked Toggle */}
+            <button
+              type="button"
+              onClick={() => setRsiLayout((prev) => (prev === 'overlay' ? 'docked' : 'overlay'))}
+              className="px-1.5 py-0.5 rounded-md bg-zinc-950/80 border border-zinc-800 text-zinc-400 hover:text-yellow-500 hover:border-yellow-500/40 transition-colors flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider"
+              title={isFloatingOverlay ? 'Dock RSI pane below price chart' : 'Float RSI as chart overlay'}
+            >
+              {isFloatingOverlay ? (
+                <>
+                  <PanelBottom className="w-3 h-3" />
+                  <span className="hidden sm:inline">Dock</span>
+                </>
+              ) : (
+                <>
+                  <PictureInPicture2 className="w-3 h-3" />
+                  <span className="hidden sm:inline">Overlay</span>
+                </>
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => toggleIndicator('rsi')}
+              className="p-0.5 rounded text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
+              title="Hide RSI Overlay"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Recharts RSI Chart Canvas */}
+        <div className="flex-1 w-full min-h-0">
+          {rsiChartData.length === 0 ? (
+            <div className="h-full flex items-center justify-center text-[11px] font-mono text-zinc-500">
+              Waiting for at least {rsiPeriod + 1} candles to compute RSI({rsiPeriod})...
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={rsiChartData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="rsiMomentumGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#c084fc" stopOpacity={0.38} />
+                    <stop offset="65%" stopColor="#c084fc" stopOpacity={0.08} />
+                    <stop offset="95%" stopColor="#c084fc" stopOpacity={0.0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  vertical={false}
+                  stroke="#27272a"
+                  opacity={0.45}
+                />
+                <ReferenceArea y1={70} y2={100} fill="rgba(239, 68, 68, 0.08)" ifOverflow="extendDomain" />
+                <ReferenceArea y1={0} y2={30} fill="rgba(16, 185, 129, 0.08)" ifOverflow="extendDomain" />
+                <XAxis
+                  dataKey="timeKey"
+                  tickFormatter={(val: string) => {
+                    const match = rsiChartData.find((p) => p.timeKey === val);
+                    return match ? match.label : '';
+                  }}
+                  stroke="#71717a"
+                  fontSize={9}
+                  tickLine={false}
+                  axisLine={false}
+                  minTickGap={36}
+                  hide={isFloatingOverlay}
+                />
+                <YAxis
+                  domain={[0, 100]}
+                  ticks={[30, 50, 70]}
+                  stroke="#71717a"
+                  fontSize={9}
+                  tickLine={false}
+                  axisLine={false}
+                  width={26}
+                />
+                <ReferenceLine y={70} stroke="#ef4444" strokeDasharray="3 3" strokeOpacity={0.75} />
+                <ReferenceLine y={50} stroke="#71717a" strokeDasharray="2 2" strokeOpacity={0.55} />
+                <ReferenceLine y={30} stroke="#10b981" strokeDasharray="3 3" strokeOpacity={0.75} />
+                {hoveredRsiPoint && (
+                  <ReferenceLine
+                    x={hoveredRsiPoint.timeKey}
+                    stroke="#eab308"
+                    strokeDasharray="3 3"
+                    strokeOpacity={0.85}
+                  />
+                )}
+                <RechartsTooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload || !payload.length) return null;
+                    const pt = payload[0].payload as RechartsRSIPoint;
+                    const zoneBadge = getRsiZoneBadge(pt.rsi);
+                    return (
+                      <div className="bg-zinc-950/95 border border-zinc-700/80 rounded-lg px-2.5 py-2 shadow-2xl text-[11px] font-mono space-y-1">
+                        <div className="text-[10px] text-zinc-400">{pt.fullTime}</div>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-purple-300 font-black">
+                            RSI({rsiPeriod}): {pt.rsi.toFixed(2)}
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase border ${zoneBadge.classes}`}
+                          >
+                            {pt.momentumZone}
+                          </span>
+                        </div>
+                        {pt.close > 0 && (
+                          <div className="text-[10px] text-zinc-400">
+                            Close: <span className="text-zinc-200 font-bold">${formatPrice(pt.close)}</span>
+                          </div>
+                        )}
+                        {pt.signal && (
+                          <div
+                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${
+                              pt.signal === 'buy'
+                                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400'
+                                : 'bg-red-500/15 border-red-500/40 text-red-400'
+                            }`}
+                          >
+                            {pt.signal === 'buy'
+                              ? 'BUY Signal (Crossed Above 30)'
+                              : 'SELL Signal (Crossed Below 70)'}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="rsi"
+                  stroke="#c084fc"
+                  strokeWidth={2}
+                  fillOpacity={1}
+                  fill="url(#rsiMomentumGradient)"
+                  isAnimationActive={false}
+                  dot={(dotProps: any) => {
+                    const { cx, cy, payload } = dotProps;
+                    if (!showRsiSignals || !payload?.signal || cx === undefined || cy === undefined) {
+                      return <g key={`empty-${payload?.timeKey ?? cx}`} />;
+                    }
+                    const isBuy = payload.signal === 'buy';
+                    return (
+                      <circle
+                        key={`sig-${payload.timeKey}`}
+                        cx={cx}
+                        cy={cy}
+                        r={4}
+                        fill={isBuy ? '#22c55e' : '#ef4444'}
+                        stroke="#09090b"
+                        strokeWidth={1.5}
+                      />
+                    );
+                  }}
+                  activeDot={{ r: 3.5, fill: '#c084fc', stroke: '#09090b', strokeWidth: 2 }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   return (
-    <div className={`w-full bg-zinc-950 rounded-xl border border-zinc-800 flex flex-col shadow-2xl shadow-black/50 ${isFullscreen ? 'h-full fixed inset-0 z-50 rounded-none border-none p-4' : 'h-[520px] p-4 sm:p-6'}`}>
+    <div className={`w-full bg-zinc-950 rounded-xl border border-zinc-800 flex flex-col shadow-2xl shadow-black/50 ${isFullscreen ? 'h-full fixed inset-0 z-50 rounded-none border-none p-4' : isRsiActive ? 'h-[580px] p-4 sm:p-6' : 'h-[520px] p-4 sm:p-6'}`}>
       {/* Top Header Row */}
       <div className="flex items-start sm:items-center justify-between mb-3 shrink-0 flex-col sm:flex-row gap-3">
         <div className="flex items-center gap-5 sm:gap-6">
@@ -1123,8 +1467,8 @@ export function TradingChart({
                   <div className="flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full bg-purple-400" />
                     <div>
-                      <div className="font-bold">RSI (14)</div>
-                      <div className="text-[10px] text-zinc-500">Relative Strength Index</div>
+                      <div className="font-bold">RSI ({rsiPeriod})</div>
+                      <div className="text-[10px] text-zinc-500">Recharts Momentum Overlay</div>
                     </div>
                   </div>
                   {activeIndicators.has('rsi') && <Check className="w-3.5 h-3.5 text-yellow-500" />}
@@ -1310,9 +1654,9 @@ export function TradingChart({
 
         {/* Active Indicators Real-time Summary Pills */}
         <div className="flex items-center gap-2 font-mono text-[10px] shrink-0">
-          {activeIndicators.has('rsi') && indicatorValues.rsi !== undefined && (
-            <span className="px-2 py-0.5 rounded bg-purple-500/15 border border-purple-500/30 text-purple-300 font-bold">
-              RSI(14): {indicatorValues.rsi.toFixed(2)}
+          {activeIndicators.has('rsi') && currentRsiValue !== undefined && (
+            <span className={`px-2 py-0.5 rounded border font-bold ${activeRsiBadge.classes}`}>
+              RSI({rsiPeriod}): {currentRsiValue.toFixed(2)} · {activeRsiBadge.label}
             </span>
           )}
           {activeIndicators.has('macd') && indicatorValues.macd !== undefined && (
@@ -1416,6 +1760,25 @@ export function TradingChart({
                   </span>
                 </div>
               )}
+              {isRsiActive && hoveredRsiPoint && (
+                <div className="flex items-center justify-between">
+                  <span className="text-zinc-500">RSI({rsiPeriod})</span>
+                  <span className="text-purple-300 font-bold">
+                    {hoveredRsiPoint.rsi.toFixed(2)}
+                    {showRsiSignals && hoveredRsiPoint.signal && (
+                      <span
+                        className={`ml-1.5 px-1 py-0.2 rounded text-[9px] uppercase ${
+                          hoveredRsiPoint.signal === 'buy'
+                            ? 'bg-emerald-500/20 text-emerald-400'
+                            : 'bg-red-500/20 text-red-400'
+                        }`}
+                      >
+                        {hoveredRsiPoint.signal}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -1428,7 +1791,11 @@ export function TradingChart({
             setTooltipPos(null);
           }}
         />
+
+        {rsiLayout === 'overlay' && renderRechartsRsiOverlay()}
       </div>
+
+      {rsiLayout === 'docked' && renderRechartsRsiOverlay()}
       
       {/* 24h Stats Footer */}
       <div className="mt-3 pt-3 border-t border-zinc-900 flex items-center justify-between shrink-0">

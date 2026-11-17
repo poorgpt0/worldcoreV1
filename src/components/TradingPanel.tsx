@@ -30,6 +30,7 @@ import {
   LiveTrade,
   DepthResult 
 } from '@/lib/binance';
+import { addSimulatedTrade } from '@/lib/simulatedTrades';
 
 interface Trade {
   id: number;
@@ -143,9 +144,20 @@ export function TradingPanel({ asset, isVerified }: { asset: Asset, isVerified: 
 
   const handlePlaceOrder = (type: 'buy' | 'sell') => {
     const orderAmount = amount || '0.05';
+    const numericAmount = parseFloat(orderAmount) || 0.05;
     const executedPrice = orderType === 'market' ? asset.price : (parseFloat(limitPrice) || asset.price);
 
     if (orderType === 'market') {
+      addSimulatedTrade({
+        asset: asset.symbol,
+        type: 'Market',
+        side: type === 'buy' ? 'Buy' : 'Sell',
+        price: executedPrice,
+        amount: numericAmount,
+        status: 'Filled',
+        leverage,
+      });
+
       // Play confirmation sound effect
       playTradeExecutionSound(type);
 
@@ -159,6 +171,7 @@ export function TradingPanel({ asset, isVerified }: { asset: Asset, isVerified: 
       setAmount('');
     } else {
       if (!amount || !limitPrice) return;
+      const numericLimitPrice = parseFloat(limitPrice) || asset.price;
       const newOrder: PendingOrder = {
         id: Math.random().toString(36).substring(7),
         type,
@@ -170,12 +183,22 @@ export function TradingPanel({ asset, isVerified }: { asset: Asset, isVerified: 
       };
       setPendingOrders(prev => [newOrder, ...prev]);
 
+      addSimulatedTrade({
+        asset: asset.symbol,
+        type: 'Limit',
+        side: type === 'buy' ? 'Buy' : 'Sell',
+        price: numericLimitPrice,
+        amount: numericAmount,
+        status: 'Open',
+        leverage,
+      });
+
       // Play confirmation sound effect
       playTradeExecutionSound(type);
 
       // Show execution toast notice
       setExecutionToast({
-        message: `Limit Order Placed: ${type === 'buy' ? 'Buy' : 'Sell'} ${amount} ${asset.symbol} @ $${formatPrice(parseFloat(limitPrice))} (${leverage}x)`,
+        message: `Limit Order Placed: ${type === 'buy' ? 'Buy' : 'Sell'} ${amount} ${asset.symbol} @ $${formatPrice(numericLimitPrice)} (${leverage}x)`,
         type,
       });
       setTimeout(() => setExecutionToast(null), 3500);

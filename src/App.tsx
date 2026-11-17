@@ -23,6 +23,7 @@ import { ContactUs } from './components/ContactUs';
 import { GeminiOracle } from './components/GeminiOracle';
 import { WorldcoreLaunchpad } from './components/WorldcoreLaunchpad';
 import { PortfolioDashboard } from './components/PortfolioDashboard';
+import { CurrencyConverter } from './components/CurrencyConverter';
 import {
   PriceAlertsModal,
   PriceAlert,
@@ -51,10 +52,10 @@ import {
 
 import { 
   INITIAL_FALLBACK_ASSETS, 
-  fetchLiveBinanceTickers, 
   formatPrice, 
   formatVolume 
 } from './lib/binance';
+import { fetchCoinGeckoMarkets } from './lib/coingecko';
 
 const queryClient = new QueryClient();
 
@@ -186,27 +187,32 @@ export default function App() {
     }
   };
 
-  // Immediate Binance fetch + Live Binance WebSocket stream + automatic polling fallback
+  // Immediate CoinGecko Markets fetch + periodic 45s refresh + live WebSocket price tick overlay
   useEffect(() => {
     let isMounted = true;
     let ws: WebSocket | null = null;
     let reconnectTimeout: any = null;
-    let lastMessageTime = 0;
 
-    // 1. Immediately fetch real Binance 24h prices
-    fetchLiveBinanceTickers().then((liveAssets) => {
-      if (isMounted && liveAssets.length > 0) {
-        setAssets(liveAssets);
-        setSelectedAsset((curr) => {
-          const match = liveAssets.find(a => a.symbol === curr.symbol);
-          return match || liveAssets[0];
+    const syncCoinGeckoMarkets = () => {
+      fetchCoinGeckoMarkets(100)
+        .then((cgAssets) => {
+          if (isMounted && cgAssets.length > 0) {
+            setAssets(cgAssets);
+            setSelectedAsset((curr) => {
+              const match = cgAssets.find((a) => a.symbol === curr.symbol);
+              return match || cgAssets[0];
+            });
+          }
+        })
+        .catch((err) => {
+          console.warn('CoinGecko markets fetch error:', err);
         });
-      }
-    }).catch(err => {
-      console.warn('Initial Binance ticker fetch error:', err);
-    });
+    };
 
-    // 2. Connect to Binance ticker array WebSocket stream
+    // 1. Immediately fetch CoinGecko markets (prices, market caps, ranks, logos, 7d sparklines)
+    syncCoinGeckoMarkets();
+
+    // 2. Connect to live WebSocket ticker stream for sub-second price updates while preserving CoinGecko metadata
     const connectWS = () => {
       try {
         ws = new WebSocket('wss://stream.binance.com:9443/ws/!ticker@arr');
@@ -216,7 +222,6 @@ export default function App() {
         };
 
         ws.onmessage = (event) => {
-          lastMessageTime = Date.now();
           if (!isMounted) return;
           try {
             const data = JSON.parse(event.data);
@@ -230,7 +235,7 @@ export default function App() {
                 const s = t.s;
                 if (typeof s === 'string' && s.endsWith('USDT')) {
                   const assetSymbol = s.slice(0, -4);
-                  const index = prev.findIndex(a => a.symbol === assetSymbol);
+                  const index = prev.findIndex((a) => a.symbol === assetSymbol);
                   if (index !== -1) {
                     if (!updated) {
                       next = [...prev];
@@ -283,7 +288,7 @@ export default function App() {
         ws.onclose = () => {
           if (isMounted) {
             setIsWsLive(false);
-            reconnectTimeout = setTimeout(connectWS, 2500);
+            reconnectTimeout = setTimeout(connectWS, 3000);
           }
         };
 
@@ -297,27 +302,12 @@ export default function App() {
 
     connectWS();
 
-    // 3. Fallback sync every 3.5 seconds if WebSocket was silent or disconnected
-    const pollInterval = setInterval(() => {
-      if (Date.now() - lastMessageTime > 3500) {
-        fetchLiveBinanceTickers().then((liveAssets) => {
-          if (isMounted && liveAssets.length > 0) {
-            setAssets((prev) => {
-              // merge live assets
-              return liveAssets;
-            });
-            setSelectedAsset((curr) => {
-              const match = liveAssets.find(a => a.symbol === curr.symbol);
-              return match || curr;
-            });
-          }
-        }).catch(() => {});
-      }
-    }, 3500);
+    // 3. Refresh CoinGecko markets every 45 seconds (aligned with server cache TTL)
+    const cgRefreshInterval = setInterval(syncCoinGeckoMarkets, 45_000);
 
     return () => {
       isMounted = false;
-      clearInterval(pollInterval);
+      clearInterval(cgRefreshInterval);
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (ws) {
         ws.onclose = null;
@@ -918,6 +908,11 @@ export default function App() {
                       activeAlertCount={
                         priceAlerts.filter((a) => a.status === 'active' && a.symbol === selectedAsset.symbol).length
                       }
+                    />
+                    <CurrencyConverter
+                      assets={assets}
+                      selectedAsset={selectedAsset}
+                      onSelectAsset={(asset) => setSelectedAsset(asset)}
                     />
                     <OrderHistory isVerified={isVerified} />
                   </div>

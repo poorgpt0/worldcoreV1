@@ -68,6 +68,59 @@ export function calculateRSI(points: KlinePoint[], period: number = 14): RSIPoin
   }
 }
 
+export interface RSICrossoverSignal {
+  time: Time;
+  type: 'buy' | 'sell';
+  rsi: number;
+  prevRsi: number;
+  price: number;
+}
+
+/**
+ * Detects RSI crossover signals from pre-computed RSI points & price candles:
+ * - Buy: previous RSI <= 30 and current RSI > 30 (crosses above oversold 30)
+ * - Sell: previous RSI >= 70 and current RSI < 70 (crosses below overbought 70)
+ */
+export function detectRSICrossovers(
+  points: KlinePoint[],
+  rsiPoints: RSIPoint[]
+): RSICrossoverSignal[] {
+  if (!points || !rsiPoints || rsiPoints.length < 2) return [];
+
+  const priceByTime = new Map<string, number>();
+  for (const pt of points) {
+    priceByTime.set(String(pt.time), pt.close ?? pt.value);
+  }
+
+  const signals: RSICrossoverSignal[] = [];
+  for (let i = 1; i < rsiPoints.length; i++) {
+    const prev = rsiPoints[i - 1].value;
+    const curr = rsiPoints[i].value;
+    const time = rsiPoints[i].time;
+    const price = priceByTime.get(String(time)) ?? 0;
+
+    if (prev <= 30 && curr > 30) {
+      signals.push({
+        time,
+        type: 'buy',
+        rsi: curr,
+        prevRsi: prev,
+        price,
+      });
+    } else if (prev >= 70 && curr < 70) {
+      signals.push({
+        time,
+        type: 'sell',
+        rsi: curr,
+        prevRsi: prev,
+        price,
+      });
+    }
+  }
+
+  return signals;
+}
+
 /**
  * Calculates Moving Average Convergence Divergence (MACD)
  * Standard parameters: fast = 12, slow = 26, signal = 9
